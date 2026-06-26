@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { pool, initDB } from "./db.js";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
+import { createClient } from "redis";
 
 dotenv.config();
 
@@ -14,14 +15,24 @@ app.use(express.json());
 
 await initDB();
 
+const redisClient = createClient({
+  url: "redis://project-redis:6379"
+});
 
-// ===============================
-// 🔐 AUTH MIDDLEWARE
-// ===============================
+redisClient.on("error", (err) => console.error("Błąd klienta Redis:", err));
+
+try {
+  await redisClient.connect();
+  console.log("🚀 Połączono z pamięcią podręczną Redis!");
+} catch (err) {
+  console.error("Nie udało się połączyć z Redisem:", err);
+}
+
 function authMiddleware(req, res, next) {
   const header = req.headers.authorization;
 
   if (!header) {
+    console.log("⚠️ Próba dostępu zablokowana: Brak tokena autoryzacji.");
     return res.status(401).json({ error: "Brak tokena" });
   }
 
@@ -32,14 +43,10 @@ function authMiddleware(req, res, next) {
     req.user = decoded;
     next();
   } catch (err) {
+    console.log("⚠️ Próba dostępu zablokowana: Nieprawidłowy lub wygasły token.");
     return res.status(401).json({ error: "Zły token" });
   }
 }
-
-
-// ===============================
-// 🔐 AUTH
-// ===============================
 
 app.post("/auth/register", async (req, res) => {
   try {
@@ -81,7 +88,6 @@ app.post("/auth/login", async (req, res) => {
     }
 
     const user = result.rows[0];
-
     const ok = await bcrypt.compare(password, user.password);
 
     if (!ok) {
@@ -101,17 +107,23 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-
-// ===============================
-// 📝 TASKS (PROTECTED)
-// ===============================
-
 app.get("/tasks", authMiddleware, async (req, res) => {
+  const cacheKey = `tasks:${req.user.id}`;
+
   try {
+    const cachedTasks = await redisClient.get(cacheKey);
+    if (cachedTasks) {
+      console.log(`[REDIS] ⚡ Dane pobrane z cache dla użytkownika ${req.user.id}`);
+      return res.json(JSON.parse(cachedTasks));
+    }
+
+    console.log(`[POSTGRES] 🗄️ Brak cache. Pobieranie z bazy danych dla użytkownika ${req.user.id}`);
     const result = await pool.query(
       "SELECT * FROM tasks WHERE user_id=$1 ORDER BY id DESC",
       [req.user.id]
     );
+
+    await redisClient.setEx(cacheKey, 30, JSON.stringify(result.rows));
 
     res.json(result.rows);
   } catch (err) {
@@ -135,6 +147,9 @@ app.post("/tasks", authMiddleware, async (req, res) => {
       [title, description, req.user.id]
     );
 
+    await redisClient.del(`tasks:${req.user.id}`);
+    console.log(`[REDIS] 🧹 Usunięto stary cache dla użytkownika ${req.user.id} (dodano nowe zadanie)`);
+
     res.json(result.rows[0]);
   } catch (err) {
     console.error(err);
@@ -149,17 +164,15 @@ app.delete("/tasks/:id", authMiddleware, async (req, res) => {
       [req.params.id, req.user.id]
     );
 
+    await redisClient.del(`tasks:${req.user.id}`);
+    console.log(`[REDIS] 🧹 Usunięto stary cache dla użytkownika ${req.user.id} (usunięto zadanie)`);
+
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Błąd usuwania taska" });
   }
 });
-
-
-// ===============================
-// 🚀 START
-// ===============================
 
 const PORT = process.env.PORT || 4000;
 
